@@ -1,0 +1,297 @@
+// ===== ESTACIÓN TERRENA - ESP32-S3 + RFM95W 915MHz =====
+// ===== RECEPCIÓN DE TELEMETRÍA Y ENVÍO DE COMANDOS =====
+#include <Arduino.h>
+#include <LoRa.h>
+#include <SPI.h>
+
+/************ PINES LORA RFM95W 915MHz ************/
+#define LORA_CS    10
+#define LORA_RST   8
+#define LORA_DIO0  9
+#define LORA_SCK   12
+#define LORA_MISO  13
+#define LORA_MOSI  11
+#define LORA_BAND  915E6  // 915 MHz
+
+/************ CONFIGURACIÓN ************/
+bool lora_ok = false;
+unsigned long lastPacketTime = 0;
+int packetsReceived = 0;
+int packetsMissed = 0;
+unsigned long sessionStart = 0;
+
+/************ ESTADÍSTICAS ************/
+struct Stats {
+  int rssi_min = 0;
+  int rssi_max = -200;
+  float rssi_avg = 0;
+  float snr_min = -20;
+  float snr_max = 20;
+  int packet_count = 0;
+} stats;
+
+/************ FUNCIONES ************/
+void sendCommand(char cmd){
+  if(!lora_ok){
+    Serial.println("[ERROR] LoRa no disponible");
+    return;
+  }
+  
+  Serial.println("\n[ENVIANDO] Comando: '" + String(cmd) + "'");
+  
+  LoRa.beginPacket();
+  LoRa.print(cmd);
+  
+  if(LoRa.endPacket()){
+    Serial.println("[OK] Comando enviado exitosamente");
+  } else {
+    Serial.println("[ERROR] Fallo al enviar comando");
+  }
+}
+
+void displayMenu(){
+  Serial.println("\n");
+  Serial.println("+========================================+");
+  Serial.println("|         ESTACION TERRENA               |");
+  Serial.println("|      ESP32-S3 + RFM95W 915MHz          |");
+  Serial.println("+========================================+");
+  Serial.println("| COMANDOS DISPONIBLES:                  |");
+  Serial.println("+========================================+");
+  Serial.println("| 1 - Servo 0deg (desplegar)             |");
+  Serial.println("| 2 - Servo 45deg (armar)                |");
+  Serial.println("| 3 - Calibrar BMP180 (altimetro)        |");
+  Serial.println("| 4 - Calibrar IMU (giroscopio)          |");
+  Serial.println("| 5 - Estado GPS                         |");
+  Serial.println("| 6 - Telemetria (20 lecturas @ 2Hz)     |");
+  Serial.println("| 7 - INICIAR VUELO                      |");
+  Serial.println("| 8 - Ver datos CSV                      |");
+  Serial.println("| 9 - Borrar CSV                         |");
+  Serial.println("| p - Parar telemetria                   |");
+  Serial.println("| m - Mostrar este menu                  |");
+  Serial.println("+========================================+");
+  Serial.println("| s - Mostrar estadisticas               |");
+  Serial.println("| r - Resetear estadisticas              |");
+  Serial.println("+========================================+");
+  Serial.println("\nEscribe un comando y presiona ENTER...\n");
+}
+
+void displayStats(){
+  unsigned long uptime = (millis() - sessionStart) / 1000;
+  
+  Serial.println("\n");
+  Serial.println("+========================================+");
+  Serial.println("|          ESTADISTICAS SESION           |");
+  Serial.println("+========================================+");
+  Serial.println("| Tiempo activo: " + String(uptime) + " segundos");
+  Serial.println("| Paquetes recibidos: " + String(packetsReceived));
+  Serial.println("| Paquetes perdidos: " + String(packetsMissed));
+  
+  if(packetsReceived > 0){
+    float successRate = (packetsReceived * 100.0) / (packetsReceived + packetsMissed);
+    Serial.println("| Tasa de exito: " + String(successRate, 1) + "%");
+    Serial.println("+========================================+");
+    Serial.println("| RSSI (senal):                          |");
+    Serial.println("|   Minimo: " + String(stats.rssi_min) + " dBm");
+    Serial.println("|   Maximo: " + String(stats.rssi_max) + " dBm");
+    Serial.println("|   Promedio: " + String(stats.rssi_avg, 1) + " dBm");
+    Serial.println("+========================================+");
+    Serial.println("| SNR (ruido):                           |");
+    Serial.println("|   Minimo: " + String(stats.snr_min, 2) + " dB");
+    Serial.println("|   Maximo: " + String(stats.snr_max, 2) + " dB");
+  }
+  
+  Serial.println("+========================================+");
+  
+  unsigned long timeSinceLastPacket = (millis() - lastPacketTime) / 1000;
+  if(lastPacketTime > 0){
+    Serial.println("| Ultimo paquete hace: " + String(timeSinceLastPacket) + "s");
+  } else {
+    Serial.println("| Sin paquetes recibidos aun");
+  }
+  Serial.println("+========================================+\n");
+}
+
+void resetStats(){
+  stats.rssi_min = 0;
+  stats.rssi_max = -200;
+  stats.rssi_avg = 0;
+  stats.snr_min = -20;
+  stats.snr_max = 20;
+  stats.packet_count = 0;
+  packetsReceived = 0;
+  packetsMissed = 0;
+  sessionStart = millis();
+  Serial.println("\n[OK] Estadisticas reseteadas\n");
+}
+
+void updateStats(int rssi, float snr){
+  packetsReceived++;
+  stats.packet_count++;
+  
+  // Actualizar RSSI
+  if(rssi > stats.rssi_max) stats.rssi_max = rssi;
+  if(rssi < stats.rssi_min || stats.rssi_min == 0) stats.rssi_min = rssi;
+  
+  // Calcular promedio RSSI
+  stats.rssi_avg = ((stats.rssi_avg * (stats.packet_count - 1)) + rssi) / stats.packet_count;
+  
+  // Actualizar SNR
+  if(snr > stats.snr_max) stats.snr_max = snr;
+  if(snr < stats.snr_min) stats.snr_min = snr;
+}
+
+String getSignalQuality(int rssi){
+  if(rssi >= -50) return "EXCELENTE";
+  if(rssi >= -60) return "MUY BUENA";
+  if(rssi >= -70) return "BUENA";
+  if(rssi >= -80) return "REGULAR";
+  if(rssi >= -90) return "DEBIL";
+  return "MUY DEBIL";
+}
+
+void processCommand(String cmd){
+  cmd.trim();
+  cmd.toLowerCase();
+  
+  if(cmd.length() == 0) return;
+  
+  if(cmd == "m"){
+    displayMenu();
+  }
+  else if(cmd == "s"){
+    displayStats();
+  }
+  else if(cmd == "r"){
+    resetStats();
+  }
+  else if(cmd.length() == 1 && ((cmd[0] >= '1' && cmd[0] <= '9') || cmd[0] == 'p')){
+    sendCommand(cmd[0]);
+  }
+  else {
+    Serial.println("[ERROR] Comando desconocido: '" + cmd + "'");
+    Serial.println("Escribe 'm' para ver el menu");
+  }
+}
+
+/************ SETUP ************/
+void setup(){
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n\n");
+  Serial.println("+============================================+");
+  Serial.println("|                                            |");
+  Serial.println("|        ESTACION TERRENA INICIANDO          |");
+  Serial.println("|      ESP32-S3 + RFM95W @ 915 MHz          |");
+  Serial.println("|                                            |");
+  Serial.println("+============================================+");
+  Serial.println("| Version: 1.0                               |");
+  Serial.println("| Fecha: 2025                                |");
+  Serial.println("+============================================+\n");
+  
+  Serial.println("[INIT] Configurando SPI...");
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  
+  Serial.println("[INIT] Configurando LoRa...");
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  
+  // Reset del modulo LoRa
+  pinMode(LORA_RST, OUTPUT);
+  digitalWrite(LORA_RST, LOW);
+  delay(10);
+  digitalWrite(LORA_RST, HIGH);
+  delay(100);
+  
+  lora_ok = LoRa.begin(LORA_BAND);
+  
+  if(lora_ok){
+    // ⚡ CONFIGURACIÓN IDÉNTICA AL COHETE
+    LoRa.setTxPower(17);              // 17 dBm
+    LoRa.setSpreadingFactor(7);       // SF7 (rapido)
+    LoRa.setSignalBandwidth(125E3);   // 125 kHz
+    LoRa.setCodingRate4(5);           // 4/5
+    LoRa.setSyncWord(0x12);           // Mismo sync word
+    
+    Serial.println("\n[OK] LoRa inicializado correctamente");
+    Serial.println("+----------------------------------------+");
+    Serial.println("| CONFIGURACION LORA:                    |");
+    Serial.println("+----------------------------------------+");
+    Serial.println("| Frecuencia: 915 MHz                    |");
+    Serial.println("| Potencia TX: 17 dBm                    |");
+    Serial.println("| Spreading Factor: 7                    |");
+    Serial.println("| Bandwidth: 125 kHz                     |");
+    Serial.println("| Coding Rate: 4/5                       |");
+    Serial.println("| Sync Word: 0x12                        |");
+    Serial.println("+----------------------------------------+");
+    Serial.println("| Pines:                                 |");
+    Serial.println("|   CS   -> GPIO 10                      |");
+    Serial.println("|   RST  -> GPIO 8                       |");
+    Serial.println("|   DIO0 -> GPIO 9                       |");
+    Serial.println("|   SCK  -> GPIO 12                      |");
+    Serial.println("|   MISO -> GPIO 13                      |");
+    Serial.println("|   MOSI -> GPIO 11                      |");
+    Serial.println("+----------------------------------------+\n");
+  } else {
+    Serial.println("\n[ERROR] Fallo al inicializar LoRa");
+    Serial.println("[ERROR] Verifica las conexiones:");
+    Serial.println("  CS   -> GPIO 10");
+    Serial.println("  RST  -> GPIO 8");
+    Serial.println("  DIO0 -> GPIO 9");
+    Serial.println("  SCK  -> GPIO 12");
+    Serial.println("  MISO -> GPIO 13");
+    Serial.println("  MOSI -> GPIO 11");
+    Serial.println("\n[WARN] Estacion terrena operando en modo limitado");
+    Serial.println("[WARN] Solo podras ver este menu pero no enviar/recibir\n");
+  }
+  
+  sessionStart = millis();
+  
+  Serial.println("[OK] Estacion terrena lista");
+  Serial.println("[INFO] Esperando telemetria del cohete...\n");
+  
+  displayMenu();
+}
+
+/************ LOOP ************/
+void loop(){
+  // ===== PROCESAR COMANDOS DEL USUARIO =====
+  if(Serial.available()){
+    String cmd = Serial.readStringUntil('\n');
+    processCommand(cmd);
+  }
+  
+  // ===== RECIBIR TELEMETRÍA DEL COHETE =====
+  if(lora_ok){
+    int packetSize = LoRa.parsePacket();
+    
+    if(packetSize > 0){
+      String message = "";
+      
+      // Leer el paquete completo
+      while(LoRa.available()){
+        message += (char)LoRa.read();
+      }
+      
+      // Obtener estadisticas de señal
+      int rssi = LoRa.packetRssi();
+      float snr = LoRa.packetSnr();
+      
+      // Actualizar estadisticas
+      updateStats(rssi, snr);
+      lastPacketTime = millis();
+      
+      // Mostrar telemetria recibida
+      Serial.println("\n+--------------------------------------------+");
+      Serial.println("| TELEMETRIA RECIBIDA:");
+      Serial.println("+--------------------------------------------+");
+      Serial.println("| " + message);
+      Serial.println("+--------------------------------------------+");
+      Serial.println("| RSSI: " + String(rssi) + " dBm (" + getSignalQuality(rssi) + ")");
+      Serial.println("| SNR:  " + String(snr, 2) + " dB");
+      Serial.println("| Paquetes: #" + String(packetsReceived));
+      Serial.println("+--------------------------------------------+\n");
+    }
+  }
+  
+  delay(10);
+}
