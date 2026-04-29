@@ -1,6 +1,4 @@
-//Codigo con sistema de recuperacion a 16 segundos despues de 7m, caida de 10m y velocidad cercana a 0 despues del lanzamiento
-
-// ===== ESP32-S3 WROOM-1: DUAL-CORE VERSION - RFM95W 915MHz =====
+// ===== ESP32-S3 WROOM-1: DUAL-CORE VERSION - RFM95W 916.3MHz =====
 // ===== OPTIMIZADO PARA ALTAS ACELERACIONES (20G) =====
 #include <Arduino.h>
 #include <Wire.h>
@@ -11,21 +9,21 @@
 #include <SPI.h>
 #include <SPIFFS.h>
 
-/************ PINES LORA RFM95W 915MHz ************/
+/************ PINES LORA RFM95W 916.3MHz ************/
 #define LORA_CS    10
 #define LORA_RST   8
 #define LORA_DIO0  9
 #define LORA_SCK   12
 #define LORA_MISO  13
 #define LORA_MOSI  11
-#define LORA_BAND  915E6  // 915 MHz
+#define LORA_BAND  916.3E6
 
 /************ OTROS PINES ************/
-#define I2C_SDA_PIN   17
-#define I2C_SCL_PIN   16
+#define I2C_SDA_PIN   6
+#define I2C_SCL_PIN   7
 #define SERVO_PIN     4
-#define GPS_RX_PIN    7
-#define GPS_TX_PIN    6
+#define GPS_RX_PIN    17
+#define GPS_TX_PIN    16
 #define GPS_BAUD      9600
 
 /************ STRUCT TELEMETRIA ************/
@@ -37,7 +35,7 @@ struct TelemetryData {
   float peak_altitude;
   float velocity;
   float acceleration;
-  float max_acceleration;  // ⚡ NUEVO: Aceleración máxima detectada
+  float max_acceleration;
   double gps_lat;
   double gps_lng;
   uint8_t gps_sats;
@@ -56,19 +54,11 @@ TelemetryData telemetry;
 SemaphoreHandle_t telemetryMutex;
 
 QueueHandle_t loraQueue;
-const int LORA_QUEUE_SIZE = 25;  // ⚡ Aumentado para alta frecuencia
+const int LORA_QUEUE_SIZE = 25;
 
 struct LoraMessage {
   char text[250];
 };
-
-/************ WATCHDOG TIMER ************/
-hw_timer_t *watchdogTimer = NULL;
-
-void IRAM_ATTR resetModule() {
-  ets_printf("WATCHDOG TIMEOUT!\n");
-  esp_restart();
-}
 
 /************ OBJETOS ************/
 Servo myServo;
@@ -89,30 +79,29 @@ int telemetryCount = 0;
 float alt0 = NAN;
 unsigned long lastTick = 0;
 unsigned long flightStartTime = 0;
-const unsigned long INTERVAL = 500;  // 2Hz
+const unsigned long INTERVAL = 500;
 const unsigned long LAUNCH_DELAY = 5500;
 
 bool timeoutTimerStarted = false;
 unsigned long timeoutStartTime = 0;
-const unsigned long TIMEOUT_DURATION = 16000;  // ⚡ CAMBIADO: 11.6s → 16s
-const float TIMEOUT_ALTITUDE_TRIGGER = 7.0f;   // ⚡ CAMBIADO: 4m → 7m
+const unsigned long TIMEOUT_DURATION = 16000;
+const float TIMEOUT_ALTITUDE_TRIGGER = 7.0f;
 
 uint8_t mpu_addr = 0x68;
 
 float pitch_offset = 0.0;
 float roll_offset = 0.0;
 
-const float DROP_FROM_PEAK_METERS = 10.0f;  // ⚡ CAMBIADO: 4m → 10m
+const float DROP_FROM_PEAK_METERS = 10.0f;
 float peakAlt = NAN;
-float maxAcceleration = 0.0;  // ⚡ NUEVO: Registro de aceleración máxima
+float maxAcceleration = 0.0;
 
 float lastAltitude = NAN;
 float lastVelocity = 0.0;
 unsigned long lastAltTime = 0;
 
-/************ BUFFER REDUCIDO PARA 20G ************/
-// ⚡ CRÍTICO: Buffer reducido de 5→3 para respuesta más rápida a cambios violentos
-const int ALT_BUFFER_SIZE = 3;
+// CORRECCION 2: Buffer aumentado a 7 muestras
+const int ALT_BUFFER_SIZE = 7;
 float altitudeBuffer[ALT_BUFFER_SIZE];
 int altBufferIndex = 0;
 bool altBufferFull = false;
@@ -120,7 +109,7 @@ bool altBufferFull = false;
 float getSmoothedAltitude(float newAlt) {
   altitudeBuffer[altBufferIndex] = newAlt;
   altBufferIndex = (altBufferIndex + 1) % ALT_BUFFER_SIZE;
-  if (altBufferIndex == 0) altBufferFull = true;
+  if(altBufferIndex == 0) altBufferFull = true;
   float sum = 0;
   int count = altBufferFull ? ALT_BUFFER_SIZE : altBufferIndex;
   for(int i = 0; i < count; i++) sum += altitudeBuffer[i];
@@ -197,11 +186,7 @@ void calibrateIMU(){
     queueLoraMessage("ERROR: IMU no disponible");
     return;
   }
-  Serial.println("\n+========================================+");
-  Serial.println("|     CALIBRANDO GIROSCOPIO (IMU)       |");
-  Serial.println("|   Mantenga el cohete VERTICAL y       |");
-  Serial.println("|   QUIETO durante la calibracion...    |");
-  Serial.println("+========================================+");
+  Serial.println("Calibrando IMU...");
   queueLoraMessage("Calibrando IMU...");
   delay(1000);
 
@@ -217,80 +202,66 @@ void calibrateIMU(){
       validSamples++;
     }
     delay(10);
-    if(i % 20 == 0) Serial.print(".");
   }
 
   if(validSamples > 50){
     pitch_offset = pitch_sum / validSamples;
     roll_offset  = roll_sum  / validSamples;
     imuCalibrated = true;
-    Serial.println("\n\n+========================================+");
-    Serial.println("|      IMU CALIBRADO EXITOSAMENTE       |");
-    Serial.println("+========================================+");
-    Serial.println("| Pitch offset: " + String(pitch_offset, 2) + "deg");
-    Serial.println("| Roll offset:  " + String(roll_offset,  2) + "deg");
-    Serial.println("+========================================+\n");
-    queueLoraMessage("IMU calibrado OK - P:" + String(pitch_offset,2) + " R:" + String(roll_offset,2));
+    Serial.println("IMU calibrado OK - P:" + String(pitch_offset,2) + " R:" + String(roll_offset,2));
+    queueLoraMessage("IMU OK P:" + String(pitch_offset,2) + " R:" + String(roll_offset,2));
   } else {
-    Serial.println("\n\nERROR: Calibracion fallida");
+    Serial.println("ERROR: Calibracion IMU fallida");
     queueLoraMessage("ERROR: Calibracion IMU fallida");
   }
 }
 
-/*** BMP180 ***/
+/*** BMP180 - CORRECCION 3: calculo de altitud estable ***/
 float readAlt(bool &ok){
   ok = false;
   if(!bmp_ok) return NAN;
-  float abs = bmp.readAltitude(101325);
-  if(isnan(abs)) return NAN;
+  float pressure = bmp.readPressure();  // Pa
+  if(pressure == 0) return NAN;
+  float absAlt = 44330.0f * (1.0f - pow(pressure / 101325.0f, 0.1903f));
+  if(isnan(absAlt)) return NAN;
   if(isnan(alt0)){
-    alt0 = abs;
+    alt0 = absAlt;
     Serial.println("Altura calibrada: 0.00 m");
     queueLoraMessage("Altura ref: " + String(alt0, 2) + "m");
   }
   ok = true;
-  return abs - alt0;
+  return absAlt - alt0;
 }
 
-/*** VELOCIDAD Y ACELERACION OPTIMIZADA PARA 20G ***/
+/*** VELOCIDAD Y ACELERACION ***/
 void calcVelocityAcceleration(float currentAlt, unsigned long currentTime, float &velocity, float &acceleration){
-  // ⚡ Suavizado REDUCIDO (buffer de 3) para capturar cambios rápidos
   float smoothedAlt = getSmoothedAltitude(currentAlt);
-  
+
   if(isnan(lastAltitude) || lastAltTime == 0){
     lastAltitude = smoothedAlt;
     lastAltTime = currentTime;
     velocity = 0.0; acceleration = 0.0; lastVelocity = 0.0;
     return;
   }
-  
+
   float deltaTime = (currentTime - lastAltTime) / 1000.0;
-  
+
   if(deltaTime < 0.5){
     velocity = lastVelocity; acceleration = 0.0;
     return;
   }
-  
-  // Calcular velocidad con datos suavizados
+
   float rawVelocity = (smoothedAlt - lastAltitude) / deltaTime;
-  
-  // ⚡ FILTRO MÁS LIGERO: 50/50 en lugar de 70/30 para capturar cambios bruscos
   velocity = 0.5 * rawVelocity + 0.5 * lastVelocity;
-  
-  // ⚡ CRÍTICO: Límite expandido a ±200 m/s para cohetes rápidos
   velocity = constrain(velocity, -200.0, 200.0);
-  
-  // Calcular aceleración
+
   float rawAccel = (velocity - lastVelocity) / deltaTime;
-  
-  // ⚡ CRÍTICO: Límite expandido a ±200 m/s² (~20g) 
   acceleration = constrain(rawAccel, -200.0, 200.0);
-  
-  // ⚡ NUEVO: Registrar aceleración máxima
+
   if(flightActive && fabs(acceleration) > maxAcceleration){
     maxAcceleration = fabs(acceleration);
   }
-  
+
   lastAltitude = smoothedAlt;
   lastVelocity = velocity;
   lastAltTime = currentTime;
@@ -305,9 +276,6 @@ void csvInit(){
     if(f){
       f.println("ms,pitch,roll,alt,vel,accel,lat,lon,gps_alt,sats,spd_kmh,course,hdop");
       f.flush(); f.close();
-      Serial.println("CSV inicializado en flash");
-    } else {
-      Serial.println("ERROR: No se pudo crear CSV");
     }
   }
 }
@@ -317,7 +285,6 @@ void saveTelemetryToCSV(){
   csvInit();
   size_t totalBytes = SPIFFS.totalBytes(), usedBytes = SPIFFS.usedBytes();
   if(usedBytes > totalBytes * 0.9){
-    Serial.println("ADVERTENCIA: Memoria flash casi llena");
     queueLoraMessage("ALERTA: Flash 90% llena");
     return;
   }
@@ -328,46 +295,44 @@ void saveTelemetryToCSV(){
       telemetry.timestamp_ms, telemetry.pitch, telemetry.roll,
       telemetry.altitude, telemetry.velocity, telemetry.acceleration,
       telemetry.gps_lat, telemetry.gps_lng, telemetry.gps_altitude,
-      telemetry.gps_sats, telemetry.gps_speed_kmh, 
+      telemetry.gps_sats, telemetry.gps_speed_kmh,
       telemetry.gps_course, telemetry.gps_hdop);
     xSemaphoreGive(telemetryMutex);
   }
   f.flush(); f.close();
 }
 
-/*** TELEMETRIA EXTENDIDA ***/
+/*** TELEMETRIA ***/
 void sendTelemetry(){
-  char buffer[400];  // ⚡ Aumentado para incluir max_accel
+  char buffer[400];
   int pos = 0;
-  
+
   if(xSemaphoreTake(telemetryMutex, pdMS_TO_TICKS(10)) == pdTRUE){
     if(telemetryOn && !flightActive)
       pos += snprintf(buffer+pos, sizeof(buffer)-pos, "[%d/20] ", telemetryCount);
-    
+
     pos += snprintf(buffer+pos, sizeof(buffer)-pos,
       "[T+%lu.%01lus] [P:%.1f] [R:%.1f] [Alt:%.2fm]",
       telemetry.timestamp_ms/1000, (telemetry.timestamp_ms%1000)/100,
       telemetry.pitch, telemetry.roll, telemetry.altitude);
-    
+
     if(!isnan(telemetry.velocity))
       pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [Vel:%.2fm/s]", telemetry.velocity);
-    
+
     if(!isnan(telemetry.acceleration)){
       pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [Acel:%.2fm/s2]", telemetry.acceleration);
-      // ⚡ NUEVO: Mostrar en Gs también
       float accel_g = telemetry.acceleration / 9.81;
       pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [%.1fg]", accel_g);
     }
-    
-    // ⚡ NUEVO: Mostrar aceleración máxima registrada
+
     if(flightActive && telemetry.max_acceleration > 0){
       float max_g = telemetry.max_acceleration / 9.81;
       pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [MaxG:%.1f]", max_g);
     }
-    
+
     if(flightActive && !isnan(telemetry.peak_altitude))
       pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [Pico:%.2fm]", telemetry.peak_altitude);
-    
+
     if(flightActive){
       if(!telemetry.recovery_active){
         unsigned long remaining = (LAUNCH_DELAY - (millis() - flightStartTime)) / 1000;
@@ -378,34 +343,25 @@ void sendTelemetry(){
           pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [TO:%us]", telemetry.timeout_remaining_s);
       }
     }
-    
-    // GPS EXTENDIDO
+
     if(telemetry.gps_sats > 0){
       pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [Sats:%d]", telemetry.gps_sats);
-      
-      if(!isnan(telemetry.gps_lat) && !isnan(telemetry.gps_lng)){
-        pos += snprintf(buffer+pos, sizeof(buffer)-pos, 
+      if(!isnan(telemetry.gps_lat) && !isnan(telemetry.gps_lng))
+        pos += snprintf(buffer+pos, sizeof(buffer)-pos,
           " [%.6f,%.6f]", telemetry.gps_lat, telemetry.gps_lng);
-      }
-      
       if(!isnan(telemetry.gps_altitude))
         pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [AltGPS:%.1fm]", telemetry.gps_altitude);
-      
       if(!isnan(telemetry.gps_speed_kmh))
         pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [VelGPS:%.1fkm/h]", telemetry.gps_speed_kmh);
-      
-      if(!isnan(telemetry.gps_course))
-        pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [Rumbo:%.0fdeg]", telemetry.gps_course);
-      
       if(!isnan(telemetry.gps_hdop))
         pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [HDOP:%.1f]", telemetry.gps_hdop);
     } else {
       pos += snprintf(buffer+pos, sizeof(buffer)-pos, " [GPS:SIN SENAL]");
     }
-    
+
     xSemaphoreGive(telemetryMutex);
   }
-  
+
   Serial.println(buffer);
   queueLoraMessage(buffer);
 }
@@ -413,36 +369,20 @@ void sendTelemetry(){
 /*** RECUPERACION ***/
 void deploy(const String &reason){
   if(deployedOnce) return;
-  noInterrupts();
   deployedOnce = true;
   myServo.write(0);
-  interrupts();
 
-  Serial.println("\n");
-  Serial.println("+============================================================+");
-  Serial.println("|                PARACAIDAS DESPLEGADO                      |");
-  Serial.println("+============================================================+");
-  Serial.println("|  RAZON DEL DESPLIEGUE:                                    |");
-  Serial.println("|  " + reason);
-  Serial.println("+============================================================+");
-  Serial.println("|  Timestamp: T+" + String(millis()/1000) + "s");
-  Serial.println("|  Servo movido a 0deg");
-  
-  // ⚡ NUEVO: Reportar aceleración máxima al desplegar
+  Serial.println("*** PARACAIDAS DESPLEGADO ***");
+  Serial.println("RAZON: " + reason);
+  Serial.println("T+" + String(millis()/1000) + "s | Servo->0deg");
   if(maxAcceleration > 0){
     float max_g = maxAcceleration / 9.81;
-    Serial.println("|  Max aceleracion: " + String(maxAcceleration, 1) + " m/s2 (" + String(max_g, 1) + "g)");
+    Serial.println("MaxG: " + String(max_g, 1) + "g");
   }
-  Serial.println("+============================================================+\n");
 
   queueLoraMessage("*** PARACAIDAS DESPLEGADO ***");
   queueLoraMessage("RAZON: " + reason);
   queueLoraMessage("T+" + String(millis()/1000) + "s | SERVO->0deg");
-  
-  if(maxAcceleration > 0){
-    float max_g = maxAcceleration / 9.81;
-    queueLoraMessage("MaxG: " + String(max_g, 1) + "g (" + String(maxAcceleration, 1) + "m/s2)");
-  }
 
   if(xSemaphoreTake(telemetryMutex, pdMS_TO_TICKS(10)) == pdTRUE){
     telemetry.parachute_deployed = true;
@@ -453,61 +393,30 @@ void deploy(const String &reason){
 /*** COMANDOS ***/
 void execCmd(char c){
   switch(c){
-
-    case '1':
-      setServo(0);
-      queueLoraMessage("Servo -> 0deg OK");
-      break;
-
-    case '2':
-      setServo(45);
-      queueLoraMessage("Servo -> 45deg OK");
-      break;
+    case '1': setServo(0);  queueLoraMessage("Servo -> 0deg OK");  break;
+    case '2': setServo(45); queueLoraMessage("Servo -> 45deg OK"); break;
 
     case '3': {
-      if(!bmp_ok){
-        Serial.println("ERROR: BMP180 no disponible");
-        queueLoraMessage("ERROR: BMP180 no disponible");
-        break;
-      }
+      if(!bmp_ok){ queueLoraMessage("ERROR: BMP180 no disponible"); break; }
       alt0 = NAN; lastAltitude = NAN; lastAltTime = 0; lastVelocity = 0.0;
       altBufferIndex = 0; altBufferFull = false;
       for(int i = 0; i < ALT_BUFFER_SIZE; i++) altitudeBuffer[i] = 0.0;
-      maxAcceleration = 0.0;  // ⚡ Reset max accel
-      
-      bool ok; float a = readAlt(ok);
-      if(ok){
-        Serial.println("\n+========================================+");
-        Serial.println("|   ALTURA BMP180 CALIBRADA              |");
-        Serial.println("+========================================+");
-        Serial.println("| Nueva referencia: 0.00 m               |");
-        Serial.print("| Presion base: "); Serial.print(alt0, 2); Serial.println(" m (abs)");
-        Serial.println("+========================================+\n");
-        queueLoraMessage("BMP180 calibrado: 0.00m");
-      } else {
-        Serial.println("ERROR: No se pudo calibrar BMP180");
-        queueLoraMessage("ERROR: No se pudo calibrar BMP180");
-      }
+      maxAcceleration = 0.0;
+      bool ok; readAlt(ok);
+      queueLoraMessage(ok ? "BMP180 calibrado: 0.00m" : "ERROR: No se pudo calibrar BMP180");
       break;
     }
 
-    case '4':
-      calibrateIMU();
-      break;
+    case '4': calibrateIMU(); break;
 
     case '5': {
       String msg = "GPS: ";
       if(gps.location.isValid()){
         msg += String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
-        msg += " | Sats:" + String(gps.satellites.value());
-        if(gps.altitude.isValid())
-          msg += " | Alt:" + String(gps.altitude.meters(), 1) + "m";
-        if(gps.speed.isValid())
-          msg += " | Vel:" + String(gps.speed.kmph(), 1) + "km/h";
-        if(gps.course.isValid())
-          msg += " | Rumbo:" + String(gps.course.deg(), 0) + "deg";
-        if(gps.hdop.isValid())
-          msg += " | HDOP:" + String(gps.hdop.hdop(), 2);
+        msg += " Sats:" + String(gps.satellites.value());
+        if(gps.altitude.isValid()) msg += " Alt:" + String(gps.altitude.meters(), 1) + "m";
+        if(gps.speed.isValid())    msg += " Vel:" + String(gps.speed.kmph(), 1) + "km/h";
+        if(gps.hdop.isValid())     msg += " HDOP:" + String(gps.hdop.hdop(), 2);
       } else {
         msg += "Sin senal (" + String(gps.satellites.value()) + " sats)";
       }
@@ -522,7 +431,7 @@ void execCmd(char c){
       altBufferIndex = 0; altBufferFull = false;
       for(int i = 0; i < ALT_BUFFER_SIZE; i++) altitudeBuffer[i] = 0.0;
       maxAcceleration = 0.0;
-      Serial.println("TELEMETRIA INICIADA (20 lecturas @ 2Hz)");
+      Serial.println("TELEMETRIA ON (20 @ 2Hz)");
       queueLoraMessage("Telemetria ON (20 @ 2Hz)");
       break;
 
@@ -531,99 +440,25 @@ void execCmd(char c){
       alt0 = NAN; peakAlt = NAN; lastAltitude = NAN; lastAltTime = 0; lastVelocity = 0.0;
       altBufferIndex = 0; altBufferFull = false;
       for(int i = 0; i < ALT_BUFFER_SIZE; i++) altitudeBuffer[i] = 0.0;
-      timeoutTimerStarted = false; timeoutStartTime = 0;
-      maxAcceleration = 0.0;  // ⚡ Reset max accel
-      
+      timeoutTimerStarted = false; timeoutStartTime = 0; maxAcceleration = 0.0;
       if(xSemaphoreTake(telemetryMutex, pdMS_TO_TICKS(10)) == pdTRUE){
         memset(&telemetry, 0, sizeof(telemetry));
         xSemaphoreGive(telemetryMutex);
       }
       csvInit();
       flightStartTime = millis();
-
-      Serial.println("\n+==========================================+");
-      Serial.println("|           VUELO INICIADO                 |");
-      Serial.println("|  Core0=Sensores | Core1=Comms            |");
-      Serial.println("|  RFM95W @ 915MHz                        |");
-      Serial.println("|  Timeout: 16s @ 7m | Caida: 10m         |");
-      Serial.println("|  Freq: 2Hz | Buffer:3 | Max: 20g        |");
-      Serial.println("+==========================================+");
-
-      Serial.println("|  [GPS] ESTADO AL INICIAR VUELO:          |");
-      Serial.println("+------------------------------------------+");
-      if(gps.location.isValid()){
-        Serial.println("|  Senal:   OK                             |");
-        Serial.print(  "|  Lat:     "); Serial.print(gps.location.lat(), 6); Serial.println(" deg");
-        Serial.print(  "|  Lng:     "); Serial.print(gps.location.lng(), 6); Serial.println(" deg");
-      } else {
-        Serial.println("|  Senal:   SIN SENAL GPS                  |");
-      }
-      if(gps.satellites.isValid()){
-        Serial.print("|  Sats:    "); Serial.println(gps.satellites.value());
-      }
-      if(gps.altitude.isValid()){
-        Serial.print("|  Alt GPS: "); Serial.print(gps.altitude.meters(), 1); Serial.println(" m");
-      }
-      if(gps.speed.isValid()){
-        Serial.print("|  Vel GPS: "); Serial.print(gps.speed.kmph(), 1); Serial.println(" km/h");
-      }
-      if(gps.course.isValid()){
-        Serial.print("|  Rumbo:   "); Serial.print(gps.course.deg(), 1); Serial.println(" deg");
-      }
-      if(gps.hdop.isValid()){
-        Serial.print("|  HDOP:    "); Serial.println(gps.hdop.hdop(), 2);
-      }
-      if(gps.date.isValid() && gps.time.isValid()){
-        char dtBuf[32];
-        snprintf(dtBuf, sizeof(dtBuf), "%02d/%02d/%04d %02d:%02d:%02d UTC",
-          gps.date.day(), gps.date.month(), gps.date.year(),
-          gps.time.hour(), gps.time.minute(), gps.time.second());
-        Serial.print("|  Hora:    "); Serial.println(dtBuf);
-      }
-      Serial.println("+==========================================+\n");
-
-      queueLoraMessage("VUELO @ 2Hz - 20G - 915MHz");
+      Serial.println("VUELO INICIADO | TO:16s@7m | CAIDA:10m | 20G");
+      queueLoraMessage("VUELO @ 2Hz - 20G - 916.3MHz");
       queueLoraMessage("TIMEOUT: 16s @ 7m | CAIDA: 10m");
-      if(gps.location.isValid()){
-        String gpsMsg = "GPS | Lat:" + String(gps.location.lat(), 6)
-                      + " Lng:" + String(gps.location.lng(), 6)
-                      + " | Sats:" + String(gps.satellites.isValid() ? gps.satellites.value() : 0);
-        if(gps.altitude.isValid())
-          gpsMsg += " | Alt:" + String(gps.altitude.meters(), 1) + "m";
-        if(gps.speed.isValid())
-          gpsMsg += " | Vel:" + String(gps.speed.kmph(), 1) + "km/h";
-        if(gps.hdop.isValid())
-          gpsMsg += " | HDOP:" + String(gps.hdop.hdop(), 2);
-        queueLoraMessage(gpsMsg);
-      } else {
-        queueLoraMessage("GPS: SIN SENAL | Sats:" +
-          String(gps.satellites.isValid() ? gps.satellites.value() : 0));
-      }
-      if(gps.date.isValid() && gps.time.isValid()){
-        char dtBuf[32];
-        snprintf(dtBuf, sizeof(dtBuf), "UTC: %02d:%02d:%02d %02d/%02d/%04d",
-          gps.time.hour(), gps.time.minute(), gps.time.second(),
-          gps.date.day(), gps.date.month(), gps.date.year());
-        queueLoraMessage(dtBuf);
-      }
       break;
 
     case '8': {
-      if(!SPIFFS.exists(CSV)){
-        Serial.println("Sin datos CSV");
-        queueLoraMessage("Sin datos CSV");
-        break;
-      }
+      if(!SPIFFS.exists(CSV)){ Serial.println("Sin datos CSV"); break; }
       File f = SPIFFS.open(CSV, "r");
       if(!f) break;
-      Serial.println("\n=== DATOS DE VUELO ===");
       int lines = 0;
-      while(f.available() && lines < 30){
-        Serial.println(f.readStringUntil('\n'));
-        lines++;
-      }
+      while(f.available() && lines < 30){ Serial.println(f.readStringUntil('\n')); lines++; }
       f.close();
-      Serial.println("======================\n");
       queueLoraMessage("CSV: " + String(lines) + " lineas");
       break;
     }
@@ -660,8 +495,7 @@ void execCmd(char c){
       queueLoraMessage("Menu OK");
       break;
 
-    default:
-      break;
+    default: break;
   }
 }
 
@@ -671,7 +505,7 @@ void execCmd(char c){
 void sensorTask(void *parameter){
   TickType_t xLastWakeTime = xTaskGetTickCount();
   const TickType_t xFrequency = pdMS_TO_TICKS(INTERVAL);
-  Serial.println("[CORE 0] Sensores @ 2Hz (20G max)");
+  Serial.println("[CORE 0] Sensores @ 2Hz");
 
   while(true){
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -690,39 +524,31 @@ void sensorTask(void *parameter){
       calcVelocityAcceleration(altRel, millis(), velocity, acceleration);
 
     if(xSemaphoreTake(telemetryMutex, pdMS_TO_TICKS(5)) == pdTRUE){
-      telemetry.timestamp_ms = millis();
-      telemetry.pitch = pitch; telemetry.roll = roll;
-      telemetry.altitude = altRel;
-      telemetry.velocity = velocity; telemetry.acceleration = acceleration;
-      telemetry.max_acceleration = maxAcceleration;  // ⚡ Actualizar max
-      
+      telemetry.timestamp_ms     = millis();
+      telemetry.pitch            = pitch;
+      telemetry.roll             = roll;
+      telemetry.altitude         = altRel;
+      telemetry.velocity         = velocity;
+      telemetry.acceleration     = acceleration;
+      telemetry.max_acceleration = maxAcceleration;
+
       bool recoveryActive = flightActive && (millis() - flightStartTime >= LAUNCH_DELAY);
       telemetry.recovery_active = recoveryActive;
       xSemaphoreGive(telemetryMutex);
 
       if(recoveryActive && altOk && !isnan(altRel)){
-
-        // ⚡ CAMBIADO: Timer inicia a los 7 metros
         if(!timeoutTimerStarted && altRel >= TIMEOUT_ALTITUDE_TRIGGER){
           timeoutTimerStarted = true;
           timeoutStartTime = millis();
-          Serial.println("\n+======================================================+");
-          Serial.println("|  TIMEOUT INICIADO @ 7 METROS                         |");
-          Serial.println("+======================================================+");
-          Serial.println("|  Altitud alcanzada: " + String(altRel, 2) + " m");
-          Serial.println("|  Tiempo para despliegue: 16 segundos                |");
-          Serial.println("|  Timestamp: T+" + String(millis()/1000) + "s");
-          Serial.println("+======================================================+\n");
-          queueLoraMessage("*** TIMEOUT START @ " + String(altRel, 1) + "m - 16s ***");
+          Serial.println("*** TIMEOUT START @ " + String(altRel,2) + "m - 16s ***");
+          queueLoraMessage("*** TIMEOUT START @ " + String(altRel,1) + "m - 16s ***");
         }
 
-        // ⚡ CAMBIADO: Verificar si ya pasaron los 16 segundos
         if(timeoutTimerStarted && !deployedOnce){
           unsigned long elapsedTimeout = millis() - timeoutStartTime;
           telemetry.timeout_remaining_s = (TIMEOUT_DURATION - elapsedTimeout) / 1000;
-          if(elapsedTimeout >= TIMEOUT_DURATION){
-            deploy("TIMEOUT 16s @ " + String(altRel,1) + "m | Pico: " + String(peakAlt,1) + "m");
-          }
+          if(elapsedTimeout >= TIMEOUT_DURATION)
+            deploy("TIMEOUT 16s @ " + String(altRel,1) + "m | Pico:" + String(peakAlt,1) + "m");
         }
 
         if(isnan(peakAlt) || altRel > peakAlt){
@@ -730,11 +556,8 @@ void sensorTask(void *parameter){
           telemetry.peak_altitude = peakAlt;
         }
 
-        // ⚡ CAMBIADO: Despliegue por caída de 10 metros desde el pico
-        if(!deployedOnce && !isnan(peakAlt) && (peakAlt - altRel) >= DROP_FROM_PEAK_METERS){
-          deploy("CAIDA " + String(DROP_FROM_PEAK_METERS,1) + "m desde pico | Pico:"
-                 + String(peakAlt,1) + "m | Actual:" + String(altRel,1) + "m");
-        }
+        if(!deployedOnce && !isnan(peakAlt) && (peakAlt - altRel) >= DROP_FROM_PEAK_METERS)
+          deploy("CAIDA 10m desde pico | Pico:" + String(peakAlt,1) + "m | Actual:" + String(altRel,1) + "m");
       }
     }
 
@@ -773,13 +596,13 @@ void commsTask(void *parameter){
         gps.encode(c);
       }
       if(xSemaphoreTake(telemetryMutex, pdMS_TO_TICKS(5)) == pdTRUE){
-        telemetry.gps_lat      = gps.location.isValid()   ? gps.location.lat()    : NAN;
-        telemetry.gps_lng      = gps.location.isValid()   ? gps.location.lng()    : NAN;
-        telemetry.gps_sats     = gps.satellites.isValid() ? gps.satellites.value(): 0;
-        telemetry.gps_speed_kmh= gps.speed.isValid()      ? gps.speed.kmph()      : NAN;
-        telemetry.gps_altitude = gps.altitude.isValid()   ? gps.altitude.meters() : NAN;
-        telemetry.gps_course   = gps.course.isValid()     ? gps.course.deg()      : NAN;
-        telemetry.gps_hdop     = gps.hdop.isValid()       ? gps.hdop.hdop()       : NAN;
+        telemetry.gps_lat       = gps.location.isValid()   ? gps.location.lat()    : NAN;
+        telemetry.gps_lng       = gps.location.isValid()   ? gps.location.lng()    : NAN;
+        telemetry.gps_sats      = gps.satellites.isValid() ? gps.satellites.value(): 0;
+        telemetry.gps_speed_kmh = gps.speed.isValid()      ? gps.speed.kmph()      : NAN;
+        telemetry.gps_altitude  = gps.altitude.isValid()   ? gps.altitude.meters() : NAN;
+        telemetry.gps_course    = gps.course.isValid()     ? gps.course.deg()      : NAN;
+        telemetry.gps_hdop      = gps.hdop.isValid()       ? gps.hdop.hdop()       : NAN;
         xSemaphoreGive(telemetryMutex);
       }
     }
@@ -794,13 +617,7 @@ void setup(){
   Serial.begin(115200);
   delay(500);
 
-  Serial.println("\n+========================================+");
-  Serial.println("|  ESP32-S3 DUAL-CORE FLIGHT COMPUTER   |");
-  Serial.println("|  Core 0: Sensores + Recuperacion      |");
-  Serial.println("|  Core 1: LoRa + GPS + SPIFFS          |");
-  Serial.println("|  RFM95W @ 915 MHz                     |");
-  Serial.println("|  2Hz | Buf:3 | 20G | TO:16s@7m        |");
-  Serial.println("+========================================+\n");
+  Serial.println("ESP32-S3 DUAL-CORE | 2Hz | 20G | TO:16s@7m");
 
   telemetryMutex = xSemaphoreCreateMutex();
   loraQueue = xQueueCreate(LORA_QUEUE_SIZE, sizeof(LoraMessage));
@@ -808,26 +625,19 @@ void setup(){
   for(int i = 0; i < ALT_BUFFER_SIZE; i++) altitudeBuffer[i] = 0.0;
   altBufferIndex = 0; altBufferFull = false;
 
-  Serial.println("Configurando Watchdog Timer...");
-  watchdogTimer = timerBegin(1000000);
-  timerAttachInterrupt(watchdogTimer, &resetModule);
-  timerAlarm(watchdogTimer, 10000000, true, 0);
-  Serial.println("Watchdog: 10s timeout\n");
-
   Serial.println("Montando SPIFFS...");
-  if(SPIFFS.begin(true)){
-    Serial.println("SPIFFS OK | Total:" + String(SPIFFS.totalBytes()/1024) +
-                   "KB | Usado:" + String(SPIFFS.usedBytes()/1024) + "KB\n");
-  }
+  if(SPIFFS.begin(true))
+    Serial.println("SPIFFS OK | " + String(SPIFFS.totalBytes()/1024) + "KB total");
 
+  // CORRECCION 1: I2C a 50kHz para estabilidad del BMP180
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(100000);
+  Wire.setClock(50000);
   Wire.setTimeout(50);
 
   mpu_ok = initMPU(0x68);
   if(!mpu_ok){ mpu_addr = 0x69; mpu_ok = initMPU(0x69); }
   Serial.println("MPU6050: " + String(mpu_ok ? "OK" : "ERROR"));
-  if(mpu_ok){ delay(1000); calibrateIMU(); }
+  if(mpu_ok){ delay(100); calibrateIMU(); }
 
   bmp_ok = bmp.begin();
   Serial.println("BMP180: " + String(bmp_ok ? "OK" : "ERROR"));
@@ -836,9 +646,8 @@ void setup(){
   setServo(45);
 
   GPS_Serial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  Serial.println("GPS: Iniciado @ 9600 baud | RX->GPIO7 | TX->GPIO6");
+  Serial.println("GPS: OK @ 9600 baud");
 
-  Serial.println("\nConfigurando RFM95W @ 915 MHz...");
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
   pinMode(LORA_RST, OUTPUT);
@@ -852,40 +661,20 @@ void setup(){
     LoRa.setSignalBandwidth(125E3);
     LoRa.setCodingRate4(5);
     LoRa.setSyncWord(0x12);
-    Serial.println("LoRa RFM95W: OK @ 915MHz | SF7 | BW125 | 17dBm");
-    queueLoraMessage("ESP32-S3 @ 2Hz - 20G - TO:16s@7m");
+    Serial.println("LoRa RFM95W: OK @ 916.3MHz");
+    queueLoraMessage("ESP32-S3 OK | 2Hz | 20G | TO:16s@7m");
   } else {
-    Serial.println("LoRa ERROR | CS:10 RST:8 DIO0:9 SCK:12 MISO:13 MOSI:11");
+    Serial.println("LoRa ERROR");
   }
 
   xTaskCreatePinnedToCore(sensorTask, "SensorTask", 4096, NULL, 2, NULL, 0);
   xTaskCreatePinnedToCore(commsTask,  "CommsTask",  8192, NULL, 1, NULL, 1);
 
-  Serial.println("\n+========================================+");
-  Serial.println("|   DUAL-CORE TASKS INICIADAS           |");
-  Serial.println("+========================================+");
-  Serial.println("| Core 0: Sensores @ 2Hz (Prio 2)       |");
-  Serial.println("| Core 1: Comms @ 2Hz    (Prio 1)       |");
-  Serial.println("+========================================+");
-  Serial.println("| RECUPERACION:                         |");
-  Serial.println("| - Delay inicial:  5.5s                |");
-  Serial.println("| - Timer inicia:   7m de altura        |");
-  Serial.println("| - Timeout:        16s desde 7m        |");
-  Serial.println("| - Caida pico:     > 10m               |");
-  Serial.println("+========================================+");
-  Serial.println("| OPTIMIZADO PARA 20G:                  |");
-  Serial.println("| - Buffer reducido: 3 muestras         |");
-  Serial.println("| - Filtro ligero: 50/50 respuesta     |");
-  Serial.println("| - Limites: +/-200m/s, +/-200m/s2      |");
-  Serial.println("| - Registro Max G en vuelo             |");
-  Serial.println("+========================================+");
-  Serial.println("\nPresiona 'm' para menu...\n");
+  Serial.println("Tasks iniciadas. Presiona 'm' para menu.");
 }
 
 /*** LOOP ***/
 void loop(){
-  timerWrite(watchdogTimer, 0);
-
   if(Serial.available()){
     char c = Serial.read();
     if(c == '\n' || c == '\r') return;
